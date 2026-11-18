@@ -16,6 +16,7 @@ GtkWidget *window,
 GtkTextBuffer *rec_buffer, *snd_buffer;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static GtkWidget *login_dialog;
 
 static int append_log(const char *prefix, const char *text)
 {
@@ -51,7 +52,7 @@ static void show_local_text(const char *text)
 	GtkTextIter start, end;
 
 	gtk_text_buffer_get_bounds(rec_buffer, &start, &end);
-	gtk_text_buffer_insert(rec_buffer, &end, "Me:", -1);
+	gtk_text_buffer_insert(rec_buffer, &end, "Me: ", -1);
 	gtk_text_buffer_insert(rec_buffer, &end, text, -1);
 	gtk_text_buffer_insert(rec_buffer, &end, "\n", 1);
 }
@@ -85,6 +86,10 @@ void send_text(GtkWidget *button, gpointer data)
 		show_err("Not connected\n");
 		return;
 	}
+	if (!connection_is_logged_in()) {
+		show_err("Log in before sending messages.\n");
+		return;
+	}
 
 	gtk_text_buffer_get_bounds(snd_buffer, &start, &end);
 	text = gtk_text_buffer_get_text(snd_buffer, &start, &end, FALSE);
@@ -110,6 +115,91 @@ void send_text(GtkWidget *button, gpointer data)
 	g_free(text);
 }
 
+void update_login_state_ui(int logged_in)
+{
+	if (snd_button != NULL)
+		gtk_widget_set_sensitive(snd_button, logged_in);
+}
+
+void request_login_name(void)
+{
+	GtkWidget *dialog;
+	GtkWidget *box;
+	GtkWidget *label;
+	GtkWidget *entry;
+	GtkWidget *error_label;
+	int sent = 0;
+
+	if (!connection_is_active() || connection_is_logged_in())
+		return;
+	if (login_dialog != NULL) {
+		gtk_window_present(GTK_WINDOW(login_dialog));
+		return;
+	}
+
+	dialog = gtk_dialog_new_with_buttons(
+		"Set your name", GTK_WINDOW(window),
+		GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+		GTK_STOCK_CANCEL, GTK_RESPONSE_CANCEL,
+		"Login", GTK_RESPONSE_ACCEPT, NULL);
+	gtk_dialog_set_default_response(GTK_DIALOG(dialog),
+					GTK_RESPONSE_ACCEPT);
+	gtk_window_set_position(GTK_WINDOW(dialog), GTK_WIN_POS_CENTER_ON_PARENT);
+
+	box = gtk_vbox_new(FALSE, 6);
+	label = gtk_label_new("Choose the name other users will see:");
+	gtk_misc_set_alignment(GTK_MISC(label), 0.0f, 0.5f);
+	entry = gtk_entry_new();
+	gtk_entry_set_max_length(GTK_ENTRY(entry), CHAT_MAX_NAME);
+	gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+	error_label = gtk_label_new("");
+	gtk_misc_set_alignment(GTK_MISC(error_label), 0.0f, 0.5f);
+
+	gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(box), error_label, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(GTK_DIALOG(dialog)->vbox), box,
+			   FALSE, FALSE, 6);
+	gtk_widget_show_all(box);
+
+	login_dialog = dialog;
+	while (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+		gchar *name = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
+		size_t length;
+
+		g_strstrip(name);
+		length = strlen(name);
+		if (length == 0) {
+			gtk_label_set_text(GTK_LABEL(error_label),
+					   "Name cannot be empty.");
+			g_free(name);
+			continue;
+		}
+		if (length > CHAT_MAX_NAME) {
+			gtk_label_set_text(GTK_LABEL(error_label),
+					   "Name is too long.");
+			g_free(name);
+			continue;
+		}
+		if (send_login(name) != 0) {
+			gtk_label_set_text(GTK_LABEL(error_label),
+					   "Connection is no longer available.");
+			g_free(name);
+			break;
+		}
+		g_free(name);
+		sent = 1;
+		break;
+	}
+
+	login_dialog = NULL;
+	gtk_widget_destroy(dialog);
+	if (!sent && !connection_is_logged_in()) {
+		close_connection();
+		show_err("Login canceled. Connection closed.\n");
+	}
+}
+
 void get_ip(GtkWidget *button, gpointer data)
 {
 	int result;
@@ -124,8 +214,10 @@ void get_ip(GtkWidget *button, gpointer data)
 		show_err("Connection failed.\n");
 	else if (result == -2)
 		show_err("Already connected to the server.\n");
-	else
-		show_err("Connected successfully.\n");
+	else {
+		show_err("Connected. Enter your name to log in.\n");
+		request_login_name();
+	}
 }
 
 void show_remote_text(const char *text)
@@ -147,6 +239,21 @@ void quit_win(GtkWidget *widget, gpointer data)
 
 	close_connection();
 	gtk_main_quit();
+}
+
+static gboolean auto_connect_idle(gpointer data)
+{
+	(void)data;
+
+	if (build_socket("127.0.0.1") != 0) {
+		show_err("Automatic connection failed. "
+			 "Click Connect to retry.\n");
+		return G_SOURCE_REMOVE;
+	}
+
+	show_err("Connected. Enter your name to log in.\n");
+	request_login_name();
+	return G_SOURCE_REMOVE;
 }
 
 int main(int argc, char **argv)
@@ -212,6 +319,8 @@ int main(int argc, char **argv)
 			 G_CALLBACK(quit_win), NULL);
 
 	gtk_widget_show_all(window);
+	update_login_state_ui(0);
+	g_idle_add(auto_connect_idle, NULL);
 	gtk_main();
 	return 0;
 }

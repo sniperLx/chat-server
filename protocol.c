@@ -48,54 +48,68 @@ static int recv_all(int fd, void *buffer, size_t length)
 	return 1;
 }
 
-int send_frame(int fd, const char *message, size_t length)
+int send_packet(int fd, uint8_t type, const char *payload, size_t length)
 {
 	uint32_t network_length;
 
-	if (message == NULL || length == 0 || length > CHAT_MAX_FRAME)
+	if (length > CHAT_MAX_FRAME - 1)
 		return -1;
-	if (memchr(message, '\0', length) != NULL)
+	if (length > 0 &&
+	    (payload == NULL || memchr(payload, '\0', length) != NULL))
 		return -1;
 
-	network_length = htonl((uint32_t)length);
+	network_length = htonl((uint32_t)length + 1);
 	if (send_all(fd, &network_length, sizeof(network_length)) != 0)
 		return -1;
+	if (send_all(fd, &type, sizeof(type)) != 0)
+		return -1;
+	if (length == 0)
+		return 0;
 
-	return send_all(fd, message, length);
+	return send_all(fd, payload, length);
 }
 
-int recv_frame(int fd, char **message, size_t *length)
+int recv_packet(int fd, uint8_t *type, char **payload, size_t *length)
 {
 	uint32_t network_length;
 	uint32_t payload_length;
-	char *payload;
+	char *packet;
 	int result;
 
-	if (message == NULL || length == NULL)
+	if (type == NULL || payload == NULL || length == NULL)
 		return -1;
 
-	*message = NULL;
+	*type = 0;
+	*payload = NULL;
 	*length = 0;
 	result = recv_all(fd, &network_length, sizeof(network_length));
 	if (result <= 0)
 		return result;
 
 	payload_length = ntohl(network_length);
-	if (payload_length == 0 || payload_length > CHAT_MAX_FRAME)
+	if (payload_length < 1 || payload_length > CHAT_MAX_FRAME)
 		return -1;
 
-	payload = malloc((size_t)payload_length + 1);
-	if (payload == NULL)
+	packet = malloc((size_t)payload_length + 1);
+	if (packet == NULL)
 		return -1;
 
-	result = recv_all(fd, payload, payload_length);
+	result = recv_all(fd, packet, payload_length);
 	if (result <= 0) {
-		free(payload);
+		free(packet);
 		return result;
 	}
 
-	payload[payload_length] = '\0';
-	*message = payload;
+	if (memchr(packet, '\0', payload_length) != NULL) {
+		free(packet);
+		return -1;
+	}
+
+	*type = (uint8_t)packet[0];
+	payload_length--;
+	memmove(packet, packet + 1, payload_length);
+	packet[payload_length] = '\0';
+	*payload = packet;
 	*length = payload_length;
 	return 1;
 }

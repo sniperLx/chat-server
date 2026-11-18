@@ -1,6 +1,6 @@
 /*
  * cl_sock.c
- * Socket connection and receiver thread for the GTK chat client.
+ * Socket connection, login state, and receiver thread for the GTK client.
  */
 
 #include "client.h"
@@ -17,17 +17,68 @@ typedef struct {
 	guint64 generation;
 } ReceiveArg;
 
+typedef struct {
+	guint64 generation;
+	uint8_t type;
+	char *payload;
+} IncomingPacket;
+
 static pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int sockfd = -1;
 static int connected = -1;
+static int logged_in;
 static guint64 connection_generation;
 
-static gboolean remote_message_idle(gpointer data)
+static gboolean packet_idle(gpointer data)
 {
-	char *message = data;
+	IncomingPacket *packet = data;
+	int current;
+	int login_state = -1;
 
-	show_remote_text(message);
-	free(message);
+	pthread_mutex_lock(&connection_mutex);
+	current = connected == 0 &&
+		  connection_generation == packet->generation;
+	if (current && packet->type == CHAT_MSG_LOGIN_OK) {
+		logged_in = 1;
+		login_state = 1;
+	} else if (current && packet->type == CHAT_MSG_LOGIN_ERROR) {
+		logged_in = 0;
+		login_state = 0;
+	}
+	pthread_mutex_unlock(&connection_mutex);
+
+	if (!current) {
+		free(packet->payload);
+		free(packet);
+		return G_SOURCE_REMOVE;
+	}
+
+	if (login_state != -1)
+		update_login_state_ui(login_state);
+
+	switch (packet->type) {
+	case CHAT_MSG_TEXT:
+		show_remote_text(packet->payload);
+		break;
+	case CHAT_MSG_LOGIN_OK:
+		show_err("Logged in as ");
+		show_err(packet->payload);
+		show_err(".\n");
+		break;
+	case CHAT_MSG_LOGIN_ERROR:
+		show_err("Login failed: ");
+		show_err(packet->payload);
+		show_err("\n");
+		request_login_name();
+		break;
+	default:
+		show_err("Server sent an unsupported message.\n");
+		close_connection();
+		break;
+	}
+
+	free(packet->payload);
+	free(packet);
 	return G_SOURCE_REMOVE;
 }
 
@@ -44,6 +95,7 @@ static gboolean disconnected_idle(gpointer data)
 	if (!show_notice)
 		return G_SOURCE_REMOVE;
 
+	update_login_state_ui(0);
 	show_err("Connection closed.\n");
 	return G_SOURCE_REMOVE;
 }
@@ -56,6 +108,7 @@ static int finish_connection(int fd, guint64 generation)
 	if (sockfd == fd && connection_generation == generation) {
 		sockfd = -1;
 		connected = -1;
+		logged_in = 0;
 		current = 1;
 	}
 	pthread_mutex_unlock(&connection_mutex);
@@ -68,6 +121,7 @@ static int finish_connection(int fd, guint64 generation)
 static void invalidate_connection(int fd)
 {
 	/* Caller holds connection_mutex. */
+	logged_in = 0;
 	shutdown(fd, SHUT_RDWR);
 	sockfd = -1;
 	connected = -1;
@@ -84,6 +138,16 @@ int connection_is_active(void)
 	return active;
 }
 
+int connection_is_logged_in(void)
+{
+	int active;
+
+	pthread_mutex_lock(&connection_mutex);
+	active = connected == 0 && logged_in;
+	pthread_mutex_unlock(&connection_mutex);
+	return active;
+}
+
 void close_connection(void)
 {
 	pthread_mutex_lock(&connection_mutex);
@@ -91,6 +155,7 @@ void close_connection(void)
 		invalidate_connection(sockfd);
 	else {
 		connected = -1;
+		logged_in = 0;
 		connection_generation++;
 	}
 	pthread_mutex_unlock(&connection_mutex);
@@ -103,16 +168,28 @@ void *recv_func(void *data)
 	guint64 generation = arg->generation;
 
 	for (;;) {
-		char *message = NULL;
+		uint8_t type;
+		char *payload = NULL;
 		size_t length = 0;
-		int result = recv_frame(fd, &message, &length);
+		IncomingPacket *packet;
+		int result = recv_packet(fd, &type, &payload, &length);
 
 		if (result <= 0)
 			break;
 		(void)length;
 
-		if (g_idle_add(remote_message_idle, message) == 0)
-			free(message);
+		packet = malloc(sizeof(*packet));
+		if (packet == NULL) {
+			free(payload);
+			break;
+		}
+		packet->generation = generation;
+		packet->type = type;
+		packet->payload = payload;
+		if (g_idle_add(packet_idle, packet) == 0) {
+			free(payload);
+			free(packet);
+		}
 	}
 
 	if (finish_connection(fd, generation))
@@ -170,8 +247,10 @@ int build_socket(const char *serv_ip)
 	connection_generation++;
 	sockfd = fd;
 	connected = 0;
+	logged_in = 0;
 	generation = connection_generation;
 	pthread_mutex_unlock(&connection_mutex);
+	update_login_state_ui(0);
 
 	arg = malloc(sizeof(*arg));
 	if (arg == NULL) {
@@ -203,6 +282,32 @@ int build_socket(const char *serv_ip)
 	return 0;
 }
 
+int send_login(const char *name)
+{
+	size_t length;
+	int result = 0;
+
+	if (name == NULL)
+		return -1;
+	length = strlen(name);
+	if (length == 0 || length > CHAT_MAX_NAME)
+		return -1;
+
+	pthread_mutex_lock(&connection_mutex);
+	if (connected != 0 || sockfd == -1) {
+		result = -1;
+	} else {
+		logged_in = 0;
+		if (send_packet(sockfd, CHAT_MSG_LOGIN, name, length) != 0) {
+			invalidate_connection(sockfd);
+			result = -1;
+		}
+	}
+	pthread_mutex_unlock(&connection_mutex);
+
+	return result;
+}
+
 int send_func(const char *text)
 {
 	size_t length;
@@ -215,9 +320,9 @@ int send_func(const char *text)
 		return -1;
 
 	pthread_mutex_lock(&connection_mutex);
-	if (connected != 0 || sockfd == -1) {
+	if (connected != 0 || sockfd == -1 || !logged_in) {
 		result = -1;
-	} else if (send_frame(sockfd, text, length) != 0) {
+	} else if (send_packet(sockfd, CHAT_MSG_TEXT, text, length) != 0) {
 		invalidate_connection(sockfd);
 		result = -1;
 	}
