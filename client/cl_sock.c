@@ -1,6 +1,11 @@
 /*
  * cl_sock.c
  * Socket connection, login state, and receiver thread for the GTK client.
+ *
+ * The socket reader must not call GTK directly. It wraps each decoded packet in
+ * an IncomingPacket and schedules packet_idle(), which runs on the GTK main
+ * thread. Connection generations prevent a stale reader from changing the state
+ * of a newer connection created after the old one was closed.
  */
 
 #include "client.h"
@@ -12,11 +17,13 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+/* A detached receiver receives an immutable snapshot of its socket identity. */
 typedef struct {
 	int fd;
 	guint64 generation;
 } ReceiveArg;
 
+/* Ownership of payload transfers from the reader thread to packet_idle(). */
 typedef struct {
 	guint64 generation;
 	uint8_t type;
@@ -29,6 +36,11 @@ static int connected = -1;
 static int logged_in;
 static guint64 connection_generation;
 
+/*
+ * Apply one packet on the GTK main thread. Connection state is read under the
+ * mutex, then released before touching widgets to avoid lock inversion with
+ * close_connection() and the receiver thread.
+ */
 static gboolean packet_idle(gpointer data)
 {
 	IncomingPacket *packet = data;
@@ -82,6 +94,7 @@ static gboolean packet_idle(gpointer data)
 	return G_SOURCE_REMOVE;
 }
 
+/* Notify the GUI only if the disconnect belongs to the visible connection. */
 static gboolean disconnected_idle(gpointer data)
 {
 	guint64 generation = (guint64)GPOINTER_TO_SIZE(data);
@@ -100,6 +113,10 @@ static gboolean disconnected_idle(gpointer data)
 	return G_SOURCE_REMOVE;
 }
 
+/*
+ * Tear down a receiver-owned connection exactly once. Returns whether this
+ * generation was still current and therefore warrants a disconnect notice.
+ */
 static int finish_connection(int fd, guint64 generation)
 {
 	int current = 0;
@@ -118,6 +135,10 @@ static int finish_connection(int fd, guint64 generation)
 	return current;
 }
 
+/*
+ * Mark the active connection unusable while holding connection_mutex. Shutdown
+ * wakes a blocked recv(); the receiver thread performs the final close.
+ */
 static void invalidate_connection(int fd)
 {
 	/* Caller holds connection_mutex. */
@@ -148,6 +169,10 @@ int connection_is_logged_in(void)
 	return active;
 }
 
+/*
+ * Invalidate the current socket from the GTK thread. The monotonic generation
+ * change makes all pending reader/idle callbacks harmless.
+ */
 void close_connection(void)
 {
 	pthread_mutex_lock(&connection_mutex);
@@ -161,6 +186,10 @@ void close_connection(void)
 	pthread_mutex_unlock(&connection_mutex);
 }
 
+/*
+ * Detached reader: decode frames, hand them to the GTK thread, and clean up its
+ * socket when EOF, a protocol error, or shutdown terminates the loop.
+ */
 void *recv_func(void *data)
 {
 	ReceiveArg *arg = data;
@@ -200,6 +229,11 @@ void *recv_func(void *data)
 	return NULL;
 }
 
+/*
+ * Connect, publish the new socket/generation pair, and start its reader thread.
+ * The second active-connection check closes the small race between the initial
+ * check and a concurrent manual Connect request.
+ */
 int build_socket(const char *serv_ip)
 {
 	struct sockaddr_in address;
@@ -282,6 +316,10 @@ int build_socket(const char *serv_ip)
 	return 0;
 }
 
+/*
+ * Send login credentials for the current connection. Setting logged_in = 0
+ * prevents text sends until a LOGIN_OK packet is processed by the GTK thread.
+ */
 int send_login(const char *name)
 {
 	size_t length;
@@ -308,6 +346,10 @@ int send_login(const char *name)
 	return result;
 }
 
+/*
+ * Serialize writes with connection teardown. Authentication is checked while
+ * holding the mutex so close/logout cannot race with packet submission.
+ */
 int send_func(const char *text)
 {
 	size_t length;

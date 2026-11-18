@@ -18,6 +18,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/*
+ * A session owns all state needed between poll iterations. No Client field is
+ * shared with another thread, so the server needs no locks.
+ *
+ * input holds bytes received from the peer, which may contain a fragment of one
+ * frame or several complete frames. output holds encoded bytes not yet accepted
+ * by the kernel; output_start..output_end is the live FIFO range.
+ */
 typedef struct {
 	int fd;
 	char name[CHAT_MAX_NAME + 1];
@@ -34,6 +42,7 @@ static Client clients[MAX_CLIENTS];
 static void broadcast_packet(Client *sender, uint8_t type,
 			     const char *payload, size_t length);
 
+/* poll() requires nonblocking descriptors so one client cannot stall the loop. */
 static int set_nonblocking(int fd)
 {
 	int flags = fcntl(fd, F_GETFL, 0);
@@ -43,6 +52,7 @@ static int set_nonblocking(int fd)
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+/* Mark a slot unused without performing any socket I/O. */
 static void reset_client(Client *client)
 {
 	client->fd = -1;
@@ -53,6 +63,13 @@ static void reset_client(Client *client)
 	client->output_end = 0;
 }
 
+/*
+ * Encode one complete frame into the client's bounded output queue.
+ *
+ * The queue is compacted before appending. If it still lacks space, the caller
+ * treats the client as too slow or broken and closes it rather than allowing
+ * memory use to grow without bound. This function never performs socket I/O.
+ */
 static int queue_packet(Client *client, uint8_t type,
 			const char *payload, size_t length)
 {
@@ -91,6 +108,11 @@ static int queue_packet(Client *client, uint8_t type,
 	return 0;
 }
 
+/*
+ * Release a session and optionally inform remaining users. Reset the slot before
+ * broadcasting so the departing client cannot receive its own leave notice.
+ * The caller must not use the client pointer after the nested broadcast returns.
+ */
 static void drop_client(Client *client, int announce)
 {
 	char message[CHAT_MAX_NAME + 32];
@@ -120,6 +142,10 @@ static void drop_client(Client *client, int announce)
 	broadcast_packet(client, CHAT_MSG_TEXT, message, (size_t)written);
 }
 
+/*
+ * Queue a message for every other authenticated session. A queue failure means
+ * that recipient has not drained enough output, so disconnect it immediately.
+ */
 static void broadcast_packet(Client *sender, uint8_t type,
 			     const char *payload, size_t length)
 {
@@ -136,6 +162,7 @@ static void broadcast_packet(Client *sender, uint8_t type,
 	}
 }
 
+/* Names are reserved only by authenticated sessions currently in the table. */
 static int name_is_used(const char *name)
 {
 	int slot;
@@ -149,6 +176,10 @@ static int name_is_used(const char *name)
 	return 0;
 }
 
+/*
+ * Names are opaque byte strings, normally UTF-8. Leading/trailing whitespace
+ * and ASCII control characters are rejected to keep prompts readable.
+ */
 static int name_is_valid(const char *name, size_t length)
 {
 	size_t index;
@@ -174,6 +205,11 @@ static int send_login_error(Client *client, const char *message)
 			    strlen(message));
 }
 
+/*
+ * Enforce the per-connection state machine:
+ * unauthenticated -> login request -> authenticated -> text messages.
+ * A failed login leaves the connection open so the client can retry a name.
+ */
 static int handle_packet(Client *client, uint8_t type,
 			 const char *payload, size_t length)
 {
@@ -194,6 +230,7 @@ static int handle_packet(Client *client, uint8_t type,
 			return send_login_error(
 				client, "That name is already in use.");
 
+		/* Commit authentication only after all validation and queueing succeed. */
 		memcpy(client->name, name, length + 1);
 		client->authenticated = 1;
 		if (queue_packet(client, CHAT_MSG_LOGIN_OK, name, length) != 0)
@@ -230,6 +267,11 @@ static int handle_packet(Client *client, uint8_t type,
 	return 0;
 }
 
+/*
+ * Consume every complete frame currently in the input buffer. Incomplete data
+ * stays for the next poll iteration; this is what supports TCP fragmentation and
+ * coalescing. A malformed frame terminates the connection.
+ */
 static int process_client_frames(Client *client)
 {
 	for (;;) {
@@ -258,12 +300,17 @@ static int process_client_frames(Client *client)
 		if (handle_packet(client, type, payload, payload_length) != 0)
 			return -1;
 
+		/* Preserve bytes belonging to the next frame, if any. */
 		memmove(client->input, client->input + frame_length,
 			client->input_length - frame_length);
 		client->input_length -= frame_length;
 	}
 }
 
+/*
+ * Read once from the socket and parse all newly completed frames. EAGAIN is
+ * expected on a nonblocking descriptor and simply ends this readiness pass.
+ */
 static int read_client(Client *client)
 {
 	ssize_t received;
@@ -286,6 +333,10 @@ static int read_client(Client *client)
 	return process_client_frames(client);
 }
 
+/*
+ * Write once from the queued output. Partial writes retain the rest for a later
+ * POLLOUT event; EAGAIN means the queue remains pending without an error.
+ */
 static int send_client_output(Client *client)
 {
 	ssize_t sent;
@@ -312,6 +363,7 @@ static int send_client_output(Client *client)
 	return 0;
 }
 
+/* Drain all pending connections so a burst of clients does not wait for poll. */
 static void accept_clients(int server_fd)
 {
 	for (;;) {
@@ -363,6 +415,7 @@ int run_server(void)
 	int reuse = 1;
 	int slot;
 
+	/* fd == -1 is the canonical "slot free" representation. */
 	for (slot = 0; slot < MAX_CLIENTS; slot++)
 		reset_client(&clients[slot]);
 
@@ -403,6 +456,11 @@ int run_server(void)
 	printf("chat server listening on port %d\n", CHAT_PORT);
 	fflush(stdout);
 
+	/*
+	 * The first pollfd is the listener; the remaining entries mirror the client
+	 * slot table. Events are built from the current snapshot and processed in
+	 * this single thread, so callbacks and broadcasts need no synchronization.
+	 */
 	for (;;) {
 		int ready;
 
@@ -433,6 +491,11 @@ int run_server(void)
 		if (fds[0].revents & (POLLERR | POLLNVAL))
 			break;
 
+		/*
+		 * Read before write so newly arrived commands can enqueue responses in
+		 * the same iteration. Each handler may remove its client, so verify the
+		 * descriptor after every call before touching the session again.
+		 */
 		for (slot = 0; slot < MAX_CLIENTS; slot++) {
 			Client *client = &clients[slot];
 			short revents = fds[slot + 1].revents;

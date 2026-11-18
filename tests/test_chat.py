@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for the poll-based chat server protocol."""
+"""Black-box integration tests for the poll-based chat server."""
 
 import socket
 import struct
@@ -17,12 +17,14 @@ MAX_TEXT = 4000
 
 
 def encode(message_type, payload=b""):
+    """Encode one frame: network-order total length, type, then payload."""
     if isinstance(payload, str):
         payload = payload.encode()
     return struct.pack("!IB", len(payload) + 1, message_type) + payload
 
 
 def recv_exact(sock, length):
+    """Read exactly length bytes or raise EOFError on a truncated response."""
     data = bytearray()
     while len(data) < length:
         chunk = sock.recv(length - len(data))
@@ -33,23 +35,27 @@ def recv_exact(sock, length):
 
 
 def recv_packet(sock):
+    """Read and decode one server frame, including its type byte."""
     network_length = struct.unpack("!I", recv_exact(sock, 4))[0]
     packet = recv_exact(sock, network_length)
     return packet[0], packet[1:].decode()
 
 
 def connect():
+    """Open a bounded test connection so a broken server cannot hang CI."""
     sock = socket.create_connection(("127.0.0.1", PORT), timeout=2)
     sock.settimeout(2)
     return sock
 
 
 def login(sock, name):
+    """Send a login frame and return the server's first response."""
     sock.sendall(encode(LOGIN, name))
     return recv_packet(sock)
 
 
 def expect_packet(sock, expected):
+    """Assert the next server packet matches the expected type and payload."""
     actual = recv_packet(sock)
     assert actual == expected, f"expected {expected!r}, got {actual!r}"
 
@@ -66,6 +72,7 @@ def main():
     clients = []
 
     try:
+        # The test owns the server process, so port 8000 must not already be in use.
         deadline = time.time() + 2
         while True:
             line = server.stdout.readline()
@@ -115,6 +122,7 @@ def main():
         clients.remove(duplicate)
         expect_packet(alice, (TEXT, "Bob left the chat"))
 
+        # A released name can be reused, including with different letter case.
         bob = connect()
         clients.append(bob)
         assert login(bob, "bob") == (LOGIN_OK, "bob")
@@ -136,6 +144,7 @@ def main():
             server.kill()
             server_output = server.communicate()[0]
 
+    # Forwarded chat bodies must stay out of the server console.
     assert "Alice: hello" not in server_output
     print("all protocol integration tests passed")
 

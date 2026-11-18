@@ -7,6 +7,7 @@
 
 #include <time.h>
 
+/* Widgets are initialized once in main() and accessed only by the GTK thread. */
 GtkWidget *window,
 	  *rec_text, *snd_text,
 	  *space_label,
@@ -18,6 +19,11 @@ GtkTextBuffer *rec_buffer, *snd_buffer;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static GtkWidget *login_dialog;
 
+/*
+ * Append one human-readable line to the current working directory's chat log.
+ * The mutex keeps the small persistence routine safe if future callers write
+ * from a non-GTK thread; all current callers run on the GTK main thread.
+ */
 static int append_log(const char *prefix, const char *text)
 {
 	FILE *out;
@@ -47,6 +53,7 @@ static int append_log(const char *prefix, const char *text)
 	return result;
 }
 
+/* Show text optimistically on the sender's screen after a successful send. */
 static void show_local_text(const char *text)
 {
 	GtkTextIter start, end;
@@ -65,6 +72,7 @@ void clean_text(void)
 	gtk_text_buffer_delete(snd_buffer, &start, &end);
 }
 
+/* Append errors and status notices to the read-only transcript. */
 void show_err(const gchar *text)
 {
 	GtkTextIter start, end;
@@ -73,6 +81,10 @@ void show_err(const gchar *text)
 	gtk_text_buffer_insert(rec_buffer, &end, text, -1);
 }
 
+/*
+ * Validate and send the composed message. The server owns fan-out, so this
+ * callback only updates the local view and persistent log after send succeeds.
+ */
 void send_text(GtkWidget *button, gpointer data)
 {
 	GtkTextIter start, end;
@@ -121,6 +133,11 @@ void update_login_state_ui(int logged_in)
 		gtk_widget_set_sensitive(snd_button, logged_in);
 }
 
+/*
+ * Collect a display name for the current connection. Login responses arrive
+ * asynchronously through packet_idle(); if the server rejects a name, that
+ * callback calls this function again while keeping the same TCP connection.
+ */
 void request_login_name(void)
 {
 	GtkWidget *dialog;
@@ -163,6 +180,7 @@ void request_login_name(void)
 	gtk_widget_show_all(box);
 
 	login_dialog = dialog;
+	/* Stay in the dialog until a name is sent or the user cancels. */
 	while (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
 		gchar *name = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
 		size_t length;
@@ -200,6 +218,7 @@ void request_login_name(void)
 	}
 }
 
+/* Manual connection retry used if the automatic startup connection fails. */
 void get_ip(GtkWidget *button, gpointer data)
 {
 	int result;
@@ -220,6 +239,7 @@ void get_ip(GtkWidget *button, gpointer data)
 	}
 }
 
+/* Called from packet_idle() on the GTK thread to display and persist a message. */
 void show_remote_text(const char *text)
 {
 	GtkTextIter start, end;
@@ -241,6 +261,11 @@ void quit_win(GtkWidget *widget, gpointer data)
 	gtk_main_quit();
 }
 
+/*
+ * Run the first connection attempt after the main window exists and the GTK
+ * event loop has started. Doing it in an idle callback keeps dialog creation on
+ * the GTK thread and lets the window paint before networking begins.
+ */
 static gboolean auto_connect_idle(gpointer data)
 {
 	(void)data;
@@ -256,6 +281,7 @@ static gboolean auto_connect_idle(gpointer data)
 	return G_SOURCE_REMOVE;
 }
 
+/* Build the window, connect signals, and enter the GTK event loop. */
 int main(int argc, char **argv)
 {
 	gtk_init(&argc, &argv);
@@ -320,6 +346,7 @@ int main(int argc, char **argv)
 
 	gtk_widget_show_all(window);
 	update_login_state_ui(0);
+	/* The first idle callback performs the automatic localhost connection. */
 	g_idle_add(auto_connect_idle, NULL);
 	gtk_main();
 	return 0;
