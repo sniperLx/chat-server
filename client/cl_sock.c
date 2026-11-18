@@ -1,91 +1,227 @@
-/************************************************
- * cl_sock.c                                    			*
- * function:                                   			 *
- *    create a socket                           		 *
- *    create a new thread,for receive function     *
- *    send message                             		 *
- ************************************************/
+/*
+ * cl_sock.c
+ * Socket connection and receiver thread for the GTK chat client.
+ */
+
 #include "client.h"
-int sockfd;
-struct sockaddr_in saddr;
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+typedef struct {
+	int fd;
+	guint64 generation;
+} ReceiveArg;
+
+static pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int sockfd = -1;
+static int connected = -1;
+static guint64 connection_generation;
+
+static gboolean remote_message_idle(gpointer data)
+{
+	char *message = data;
+
+	show_remote_text(message);
+	free(message);
+	return G_SOURCE_REMOVE;
+}
+
+static gboolean disconnected_idle(gpointer data)
+{
+	guint64 generation = (guint64)GPOINTER_TO_SIZE(data);
+	int show_notice;
+
+	pthread_mutex_lock(&connection_mutex);
+	show_notice = connected != 0 &&
+		      connection_generation == generation;
+	pthread_mutex_unlock(&connection_mutex);
+
+	if (!show_notice)
+		return G_SOURCE_REMOVE;
+
+	show_err("Connection closed.\n");
+	return G_SOURCE_REMOVE;
+}
+
+static int finish_connection(int fd, guint64 generation)
+{
+	int current = 0;
+
+	pthread_mutex_lock(&connection_mutex);
+	if (sockfd == fd && connection_generation == generation) {
+		sockfd = -1;
+		connected = -1;
+		current = 1;
+	}
+	pthread_mutex_unlock(&connection_mutex);
+
+	shutdown(fd, SHUT_RDWR);
+	close(fd);
+	return current;
+}
+
+static void invalidate_connection(int fd)
+{
+	/* Caller holds connection_mutex. */
+	shutdown(fd, SHUT_RDWR);
+	sockfd = -1;
+	connected = -1;
+	connection_generation++;
+}
+
+int connection_is_active(void)
+{
+	int active;
+
+	pthread_mutex_lock(&connection_mutex);
+	active = connected == 0;
+	pthread_mutex_unlock(&connection_mutex);
+	return active;
+}
+
+void close_connection(void)
+{
+	pthread_mutex_lock(&connection_mutex);
+	if (sockfd != -1)
+		invalidate_connection(sockfd);
+	else {
+		connected = -1;
+		connection_generation++;
+	}
+	pthread_mutex_unlock(&connection_mutex);
+}
+
+void *recv_func(void *data)
+{
+	ReceiveArg *arg = data;
+	int fd = arg->fd;
+	guint64 generation = arg->generation;
+
+	for (;;) {
+		char *message = NULL;
+		size_t length = 0;
+		int result = recv_frame(fd, &message, &length);
+
+		if (result <= 0)
+			break;
+		(void)length;
+
+		if (g_idle_add(remote_message_idle, message) == 0)
+			free(message);
+	}
+
+	if (finish_connection(fd, generation))
+		g_idle_add(disconnected_idle,
+			   GSIZE_TO_POINTER((gsize)generation));
+
+	free(arg);
+	return NULL;
+}
+
 int build_socket(const char *serv_ip)
 {
-	int res;
-	int clen;
-	pthread_t recv_thread;
+	struct sockaddr_in address;
+	struct timeval send_timeout;
+	pthread_t receive_thread;
 	pthread_attr_t thread_attr;
-	/* set status of thread */
-	res=pthread_attr_init(&thread_attr);
-	if(res!=0)
-	{
-		perror("Setting detached attribute failed");
-		exit(EXIT_FAILURE);
+	ReceiveArg *arg;
+	guint64 generation;
+	int fd;
+	int result;
+
+	if (connection_is_active())
+		return -2;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd == -1)
+		return -1;
+
+	memset(&address, 0, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_port = htons(CHAT_PORT);
+	result = inet_pton(AF_INET, serv_ip, &address.sin_addr);
+	if (result != 1) {
+		close(fd);
+		return result == 0 ? 1 : -1;
 	}
-	//sockfd=socket(AF_INET,SOCK_DGRAM,0); /* create a socket */
-	sockfd=socket(AF_INET,SOCK_STREAM,0);
-	if(sockfd==-1)
-	{
-		perror("Socket Error");
-		exit(1);
-	}
-	bzero(&saddr,sizeof(saddr));
-	saddr.sin_family=AF_INET;
-	saddr.sin_port=htons(PORT);
-	res=inet_pton(AF_INET,serv_ip,&saddr.sin_addr);/*转十进制ip为二进制*/
-	if(res==0){ /* the serv_ip is invalid */
-		return 1;
-	}
-	else if(res==-1){
+
+	result = connect(fd, (struct sockaddr *)&address, sizeof(address));
+	if (result == -1) {
+		close(fd);
 		return -1;
 	}
-	/* connect with sever*/
-	clen = sizeof(saddr);
-	connect(sockfd, (struct sockaddr *)&saddr,clen);
 
-	/* set the stats of thread:means do not wait for the return value of subthread */
-	res=pthread_attr_setdetachstate(&thread_attr,PTHREAD_CREATE_DETACHED);
-	if(res!=0)
-	{
-		perror("Setting detached attribute failed");
-		exit(EXIT_FAILURE);
+	send_timeout.tv_sec = 5;
+	send_timeout.tv_usec = 0;
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+			 &send_timeout, sizeof(send_timeout));
+
+	pthread_mutex_lock(&connection_mutex);
+	if (connected == 0) {
+		pthread_mutex_unlock(&connection_mutex);
+		close(fd);
+		return -2;
 	}
-	/* Create a thread,to process the receive function. */
-	res=pthread_create(&recv_thread,&thread_attr,&recv_func,NULL);
-	if(res!=0)
-	{
-		perror("Thread create error");
-		exit(EXIT_FAILURE);
+	connection_generation++;
+	sockfd = fd;
+	connected = 0;
+	generation = connection_generation;
+	pthread_mutex_unlock(&connection_mutex);
+
+	arg = malloc(sizeof(*arg));
+	if (arg == NULL) {
+		finish_connection(fd, generation);
+		return -1;
 	}
-	/* callback the attribute */
+	arg->fd = fd;
+	arg->generation = generation;
+
+	result = pthread_attr_init(&thread_attr);
+	if (result != 0) {
+		free(arg);
+		finish_connection(fd, generation);
+		return -1;
+	}
+	result = pthread_attr_setdetachstate(&thread_attr,
+					     PTHREAD_CREATE_DETACHED);
+	if (result == 0)
+		result = pthread_create(&receive_thread, &thread_attr,
+					recv_func, arg);
 	(void)pthread_attr_destroy(&thread_attr);
+
+	if (result != 0) {
+		free(arg);
+		finish_connection(fd, generation);
+		return -1;
+	}
+
 	return 0;
 }
-/* send function */
-void send_func(const char *text)
-{
-	int n;
-	printf("text:%s\n",text);
-	n=send(sockfd,text,MAXSIZE,0);	
-	if(n<0)
-	{
-		perror("S send error");
-		exit(1);
-	}
-}
 
-/* a new thread,to receive message */
-void *recv_func(void *arg)
+int send_func(const char *text)
 {
-	char rcvd_mess[MAXSIZE];
-	while(1)
-	{
-		bzero(rcvd_mess,MAXSIZE);
-		if(recv(sockfd,rcvd_mess,MAXSIZE,0) == 0)  /*阻塞直到收到客户端发的消息*/
-		{
-			perror("server recv error");
-			exit(1);
-		}
-		printf("rcvd_mess:%s\n",rcvd_mess);
-		show_remote_text(rcvd_mess);
+	size_t length;
+	int result = 0;
+
+	if (text == NULL)
+		return -1;
+	length = strlen(text);
+	if (length == 0 || length > CHAT_MAX_TEXT)
+		return -1;
+
+	pthread_mutex_lock(&connection_mutex);
+	if (connected != 0 || sockfd == -1) {
+		result = -1;
+	} else if (send_frame(sockfd, text, length) != 0) {
+		invalidate_connection(sockfd);
+		result = -1;
 	}
+	pthread_mutex_unlock(&connection_mutex);
+
+	return result;
 }

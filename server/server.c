@@ -1,142 +1,243 @@
-/************************************************
- * se_sock.c                                  		     *
- * function:                                  		     *
- *    create a socket                        		     *
- *    create a new thread,for receive function  *
- *    send message                             	      *
- ************************************************/
+/*
+ * server.c
+ * Multi-client TCP chat server. Messages are relayed to every other client.
+ */
+
 #include "server.h"
 
-#define N 10
-socklen_t clen;//客户端地址结构体长度
+typedef struct {
+	int fd;
+	int slot;
+} ClientArg;
 
-int s_sockfd; //server socket fd
-int c_sockfd[N];//clients socket fd
-int c_num = 0; //clients number
-pthread_t recv_thread[N]; //save subthread pid
-struct sockaddr_in saddr,caddr;//saddr表示本地服务器地址信息，caddr用于保存向本服务器发送信息的主机地址信息
-int build_socket()
+static int client_fds[MAX_CLIENTS];
+static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t broadcast_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int reserve_client_slot(int fd)
 {
-	int res;
-	int reuse = 0; //reuse port
-	pthread_attr_t thread_attr;
-	memset(c_sockfd,-1,sizeof(c_sockfd));
+	int slot;
 
-	/* Set status of thread */
-	res=pthread_attr_init(&thread_attr);
-	if(res!=0)
-	{
-		printf("Setting detached attribute failed");
-		exit(EXIT_FAILURE);
-	}
-	/* Create a socket */
-	if((s_sockfd=socket(AF_INET,SOCK_STREAM,0)) < 0)
-	{
-		perror("Socket Error");
-		exit(1);
-	}
-	/*avoid error: address already in use(when server down, we can reuse port immediately)*/
- 	if (setsockopt(s_sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0)
-       	{
-                perror("setsockopet error");
-                return -1;
-       	}
-	
-	bzero(&saddr,sizeof(struct sockaddr));
-	saddr.sin_family=AF_INET;
-	saddr.sin_addr.s_addr=htonl(INADDR_ANY);
-	saddr.sin_port=htons(PORT);
-	if(bind(s_sockfd,(struct sockaddr *)&saddr,sizeof(struct sockaddr_in))==-1)
-	{
-		perror("Bind Error");
-		exit(1);
-	}
-	if((res = listen(s_sockfd,5)) == -1)
-		perror("listen failed");
-	signal(SIGCHLD,SIG_IGN);
-
-	/* Set the status of thread,don't wait for return of the subthread */
-	res=pthread_attr_setdetachstate(&thread_attr,PTHREAD_CREATE_DETACHED);
-	if(res!=0)
-	{
-		printf("Setting detached attribute failed");
-		exit(EXIT_FAILURE);
-	}
-	
-	while(1){
-		int clientfd;
-		clen = sizeof(caddr);
-		printf("Server waiting connection...\n");
-		clientfd = accept(s_sockfd, (struct sockaddr *)&caddr, &clen);
-		printf("in main thread,connection with %s:%d(fd = %d) builded\n",inet_ntoa(caddr.sin_addr),ntohs(caddr.sin_port),clientfd);
-		/* Create a sub thread,call recv_func() */
-		res = pthread_create(&recv_thread[c_num],&thread_attr,(void *)recv_func,(void *)&clientfd); 
-
-		c_sockfd[c_num] = clientfd;
-		//printf("c_sockfd[%d]:%d\n",c_num,c_sockfd[c_num]);
-		c_num++;
-
-		if(res != 0)
-		{
-			printf("Thread create error");
-			exit(EXIT_FAILURE);
+	pthread_mutex_lock(&clients_mutex);
+	for (slot = 0; slot < MAX_CLIENTS; slot++) {
+		if (client_fds[slot] == -1) {
+			client_fds[slot] = fd;
+			pthread_mutex_unlock(&clients_mutex);
+			return slot;
 		}
-		
 	}
-	/* Callback the attribute of thread */
-	(void)pthread_attr_destroy(&thread_attr);
-	return 0;
+	pthread_mutex_unlock(&clients_mutex);
+	return -1;
 }
-/* Receive function */
-void *recv_func(int *_clientfd)
+
+static void release_client_slot(int slot, int fd)
 {
-		
-	int clientfd = *_clientfd;
-	int i,j;
-	int loc = -1;
-	int n_recv; //received bit num	
-	char recv_text[MAXSIZE],temp[MAXSIZE];
-	for(j = 0; j < c_num; j++) //find current client's fd index in fd array
-	{
-		if(c_sockfd[j] == clientfd)
-		{
-			loc = j;
+	int release = 0;
+
+	pthread_mutex_lock(&clients_mutex);
+	if (slot >= 0 && slot < MAX_CLIENTS && client_fds[slot] == fd) {
+		client_fds[slot] = -1;
+		release = 1;
+	}
+	pthread_mutex_unlock(&clients_mutex);
+
+	if (release) {
+		shutdown(fd, SHUT_RDWR);
+		close(fd);
+	}
+}
+
+static void broadcast_message(int sender_fd, const char *message,
+			      size_t length)
+{
+	int duplicates[MAX_CLIENTS];
+	int duplicate_count = 0;
+	int slot;
+
+	pthread_mutex_lock(&clients_mutex);
+	for (slot = 0; slot < MAX_CLIENTS; slot++) {
+		int fd = client_fds[slot];
+
+		if (fd == -1 || fd == sender_fd)
+			continue;
+
+		/*
+		 * Keep the socket alive after releasing the mutex. This avoids
+		 * sending through a descriptor that another thread just closed
+		 * and whose number may have been reused.
+		 */
+		fd = dup(fd);
+		if (fd != -1)
+			duplicates[duplicate_count++] = fd;
+	}
+	pthread_mutex_unlock(&clients_mutex);
+
+	pthread_mutex_lock(&broadcast_mutex);
+	for (slot = 0; slot < duplicate_count; slot++) {
+		if (send_frame(duplicates[slot], message, length) != 0)
+			shutdown(duplicates[slot], SHUT_RDWR);
+		close(duplicates[slot]);
+	}
+	pthread_mutex_unlock(&broadcast_mutex);
+}
+
+void *client_thread(void *data)
+{
+	ClientArg *arg = data;
+	int fd = arg->fd;
+	int slot = arg->slot;
+
+	for (;;) {
+		char *message = NULL;
+		char outbound[CHAT_MAX_FRAME + 1];
+		size_t length = 0;
+		int result;
+		int written;
+
+		result = recv_frame(fd, &message, &length);
+		if (result <= 0)
+			break;
+
+		if (length > CHAT_MAX_TEXT ||
+		    memchr(message, '\0', length) != NULL) {
+			free(message);
+			fprintf(stderr, "client(fd=%d) sent an invalid message\n",
+				fd);
 			break;
 		}
-			
-	}
-	//printf("in recv_func,clientfd:%d\n",clientfd); //for test
-	while(1)
-	{	/* To Receive message from client and get the address infomation */
-		//printf("server waiting for receiving data...\n");
-		n_recv = recv(clientfd,recv_text,MAXSIZE,0);
-		if( n_recv == 0)  
-		{
-			printf("client(fd = %d) exit\n",clientfd);
-			c_sockfd[loc] = -1;
-			pthread_exit(NULL);
-			
+
+		written = snprintf(outbound, sizeof(outbound), "fd_%d:%.*s",
+				   fd, (int)length, message);
+		if (written <= 0 || (size_t)written >= sizeof(outbound)) {
+			free(message);
+			continue;
 		}
-		strcpy(temp,recv_text);
-		sprintf(recv_text,"fd_%d:",clientfd);
-		//strcpy(recv_text,name);
-		//strcat(name,recv_text);
-		strcat(recv_text,temp);
-		printf("in subthread,recv text from client(fd = %d):%s\n",clientfd,recv_text);
-		for(i = 0; i < c_num; i++)
-		{
-			if(c_sockfd[i] != clientfd && c_sockfd[i] != -1)
-				if(send(c_sockfd[i],recv_text,MAXSIZE,0) == 0){
-					printf("send to client %d(fd = %d) zero bit\n",i,c_sockfd[i]);
-					perror("send");
-				}
-		}
+
+		printf("client(fd=%d): %s\n", fd, message);
+		broadcast_message(fd, outbound, (size_t)written);
+		free(message);
 	}
+
+	printf("client(fd=%d) disconnected\n", fd);
+	release_client_slot(slot, fd);
+	free(arg);
+	return NULL;
 }
 
-int main()
+int run_server(void)
 {
-	build_socket();
-	return 0;
+	struct sockaddr_in server_address;
+	struct sockaddr_in client_address;
+	pthread_attr_t thread_attr;
+	socklen_t client_address_length;
+	int server_fd;
+	int reuse = 1;
+	int slot;
+	int result;
+
+	for (slot = 0; slot < MAX_CLIENTS; slot++)
+		client_fds[slot] = -1;
+
+	server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (server_fd == -1) {
+		perror("socket");
+		return -1;
+	}
+	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+		       &reuse, sizeof(reuse)) == -1) {
+		perror("setsockopt");
+		close(server_fd);
+		return -1;
+	}
+
+	memset(&server_address, 0, sizeof(server_address));
+	server_address.sin_family = AF_INET;
+	server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+	server_address.sin_port = htons(CHAT_PORT);
+
+	if (bind(server_fd, (struct sockaddr *)&server_address,
+		 sizeof(server_address)) == -1) {
+		perror("bind");
+		close(server_fd);
+		return -1;
+	}
+	if (listen(server_fd, MAX_CLIENTS) == -1) {
+		perror("listen");
+		close(server_fd);
+		return -1;
+	}
+
+	result = pthread_attr_init(&thread_attr);
+	if (result != 0) {
+		fprintf(stderr, "pthread_attr_init: %s\n", strerror(result));
+		close(server_fd);
+		return -1;
+	}
+	result = pthread_attr_setdetachstate(&thread_attr,
+					     PTHREAD_CREATE_DETACHED);
+	if (result != 0) {
+		fprintf(stderr, "pthread_attr_setdetachstate: %s\n",
+			strerror(result));
+		pthread_attr_destroy(&thread_attr);
+		close(server_fd);
+		return -1;
+	}
+
+	printf("chat server listening on port %d\n", CHAT_PORT);
+	for (;;) {
+		ClientArg *arg;
+		struct timeval send_timeout;
+		pthread_t thread;
+		int client_fd;
+
+		client_address_length = sizeof(client_address);
+		client_fd = accept(server_fd,
+				   (struct sockaddr *)&client_address,
+				   &client_address_length);
+		if (client_fd == -1) {
+			if (errno == EINTR)
+				continue;
+			perror("accept");
+			continue;
+		}
+
+		send_timeout.tv_sec = 5;
+		send_timeout.tv_usec = 0;
+		(void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+				 &send_timeout, sizeof(send_timeout));
+
+		slot = reserve_client_slot(client_fd);
+		if (slot == -1) {
+			printf("connection rejected: server is full\n");
+			close(client_fd);
+			continue;
+		}
+
+		arg = malloc(sizeof(*arg));
+		if (arg == NULL) {
+			release_client_slot(slot, client_fd);
+			continue;
+		}
+		arg->fd = client_fd;
+		arg->slot = slot;
+
+		result = pthread_create(&thread, &thread_attr,
+					client_thread, arg);
+		if (result != 0) {
+			fprintf(stderr, "pthread_create: %s\n",
+				strerror(result));
+			free(arg);
+			release_client_slot(slot, client_fd);
+			continue;
+		}
+
+		printf("client connected from %s:%d (fd=%d)\n",
+		       inet_ntoa(client_address.sin_addr),
+		       ntohs(client_address.sin_port), client_fd);
+	}
 }
 
+int main(void)
+{
+	return run_server() == 0 ? 0 : 1;
+}
